@@ -23,9 +23,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
-      - name: Train model and export INT8 ONNX artifact
+      - name: Train model and export INT8 ONNX & NumPy artifacts
         run: python -m ml.train_export
 
       - name: Run full verification gate (SNR, EER, ECE, Latency, Hash-Chain)

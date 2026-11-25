@@ -1,13 +1,4 @@
 fastapi
 uvicorn[standard]
-websockets
 numpy
-scipy
-torch
-torchaudio
-onnx
-onnxruntime
-sqlalchemy
-pytest
-httpx
 python-multipart

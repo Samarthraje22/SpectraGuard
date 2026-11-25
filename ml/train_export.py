@@ -246,13 +246,23 @@ def run_pipeline(
     print(f"ECE (Before TempScale): {pre_ece:.4f}")
     print(f"ECE (After TempScale):  {post_ece:.4f} (T = {learned_temp:.4f})")
 
-    # Save PyTorch weights & export FP32 + INT8 ONNX
+    # Save PyTorch weights, compressed NumPy weights, & export FP32 + INT8 ONNX
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     pt_path = artifacts_dir / "spectraguard.pt"
+    npz_path = artifacts_dir / "spectraguard_weights.npz"
     fp32_onnx_path = artifacts_dir / "spectraguard_fp32.onnx"
     int8_onnx_path = artifacts_dir / "spectraguard_int8.onnx"
 
-    torch.save(model.state_dict(), pt_path)
+    state_dict = model.state_dict()
+    torch.save(state_dict, pt_path)
+    np.savez_compressed(
+        npz_path,
+        **{
+            k: v.detach().cpu().numpy().astype(np.float32)
+            for k, v in state_dict.items()
+            if not k.endswith("num_batches_tracked")
+        },
+    )
 
     dummy_input = torch.randn(1, 1, 64, val_x.shape[-1], dtype=torch.float32)
     torch.onnx.export(
@@ -286,6 +296,7 @@ def run_pipeline(
 
     print("\n=== ONNX Export & Quantization ===")
     print(f"PyTorch Checkpoint: {pt_path} ({pt_path.stat().st_size / 1024:.1f} KB)")
+    print(f"NumPy Weights NPZ:  {npz_path} ({npz_path.stat().st_size / 1024:.1f} KB)")
     print(f"FP32 ONNX Model:    {fp32_onnx_path} ({fp32_bytes / 1024:.1f} KB)")
     print(f"INT8 ONNX Model:    {int8_onnx_path} ({int8_bytes / 1024:.1f} KB)")
     print(f"Compression Ratio:  {compression_pct:.1f}% size reduction")

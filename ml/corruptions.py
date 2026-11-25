@@ -5,7 +5,14 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from scipy import signal
+
+try:
+    from scipy import signal
+
+    SCIPY_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    signal = None  # type: ignore[assignment]
+    SCIPY_AVAILABLE = False
 
 
 SAMPLE_RATE = 16000
@@ -66,8 +73,17 @@ def telephony_bandpass(
         raise ValueError(
             f"Bandpass cutoffs must satisfy 0 < low_hz < high_hz < {nyquist}, got ({low_hz}, {high_hz})"
         )
-    sos = signal.butter(order, [low_hz, high_hz], btype="bandpass", fs=sample_rate, output="sos")
-    filtered = signal.sosfiltfilt(sos, x)
+    if SCIPY_AVAILABLE and signal is not None:
+        sos = signal.butter(order, [low_hz, high_hz], btype="bandpass", fs=sample_rate, output="sos")
+        filtered = signal.sosfiltfilt(sos, x)
+    else:
+        freqs = np.fft.rfftfreq(len(x), d=1.0 / sample_rate)
+        spec = np.fft.rfft(x)
+        lp = 1.0 / (1.0 + (freqs / high_hz) ** (2 * order))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = np.where(freqs > 0.0, (low_hz / np.maximum(freqs, 1e-9)) ** (2 * order), np.inf)
+        hp = np.where(freqs > 0.0, 1.0 / (1.0 + ratio), 0.0)
+        filtered = np.fft.irfft(spec * (lp * hp) ** 2, n=len(x))
     return _finalize_audio(filtered, len(x))
 
 
@@ -83,9 +99,14 @@ def resampling_jitter(
     if intermediate_sr == sample_rate:
         return _finalize_audio(x, len(x))
 
-    g1 = math.gcd(intermediate_sr, sample_rate)
-    down = signal.resample_poly(x, intermediate_sr // g1, sample_rate // g1)
-    up = signal.resample_poly(down, sample_rate // g1, intermediate_sr // g1)
+    if SCIPY_AVAILABLE and signal is not None:
+        g1 = math.gcd(intermediate_sr, sample_rate)
+        down = signal.resample_poly(x, intermediate_sr // g1, sample_rate // g1)
+        up = signal.resample_poly(down, sample_rate // g1, intermediate_sr // g1)
+    else:
+        n_down = max(1, int(round(len(x) * intermediate_sr / sample_rate)))
+        down = np.interp(np.linspace(0, len(x) - 1, n_down), np.arange(len(x)), x)
+        up = np.interp(np.linspace(0, n_down - 1, len(x)), np.arange(n_down), down)
     return _finalize_audio(up, len(x))
 
 
@@ -142,8 +163,16 @@ def high_freq_adversarial_noise(
 
     rng = np.random.default_rng(seed)
     raw = rng.standard_normal(len(x))
-    sos = signal.butter(5, cutoff_hz, btype="highpass", fs=sample_rate, output="sos")
-    hf = signal.sosfiltfilt(sos, raw)
+    if SCIPY_AVAILABLE and signal is not None:
+        sos = signal.butter(5, cutoff_hz, btype="highpass", fs=sample_rate, output="sos")
+        hf = signal.sosfiltfilt(sos, raw)
+    else:
+        freqs = np.fft.rfftfreq(len(raw), d=1.0 / sample_rate)
+        spec = np.fft.rfft(raw)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = np.where(freqs > 0.0, (cutoff_hz / np.maximum(freqs, 1e-9)) ** 10, np.inf)
+        hp = np.where(freqs > 0.0, 1.0 / (1.0 + ratio), 0.0)
+        hf = np.fft.irfft(spec * (hp**2), n=len(raw))
     max_abs = float(np.max(np.abs(hf)))
     if max_abs > 1e-12:
         hf = (hf / max_abs) * eps

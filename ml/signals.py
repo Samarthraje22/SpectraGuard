@@ -1,14 +1,54 @@
-"""Torch-free deterministic 16 kHz genuine speech and vocoder spoof waveform generators."""
+"""Torch-free and SciPy-optional deterministic 16 kHz genuine speech and vocoder spoof generators."""
 
 from __future__ import annotations
 
 import numpy as np
-from scipy import signal
+
+try:
+    from scipy import signal
+
+    SCIPY_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    signal = None  # type: ignore[assignment]
+    SCIPY_AVAILABLE = False
 
 
 SAMPLE_RATE = 16000
 CLIP_SECONDS = 2.0
 CLIP_SAMPLES = int(SAMPLE_RATE * CLIP_SECONDS)  # 32,000 samples
+
+
+def _fft_bandpass(x: np.ndarray, low_hz: float, high_hz: float, order: int = 4) -> np.ndarray:
+    freqs = np.fft.rfftfreq(len(x), d=1.0 / SAMPLE_RATE)
+    spec = np.fft.rfft(x)
+    lp = 1.0 / (1.0 + (freqs / high_hz) ** (2 * order))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(freqs > 0.0, (low_hz / np.maximum(freqs, 1e-9)) ** (2 * order), np.inf)
+    hp = np.where(freqs > 0.0, 1.0 / (1.0 + ratio), 0.0)
+    return np.fft.irfft(spec * (lp * hp) ** 2, n=len(x))
+
+
+def _fft_highpass(x: np.ndarray, cutoff_hz: float, order: int = 4) -> np.ndarray:
+    freqs = np.fft.rfftfreq(len(x), d=1.0 / SAMPLE_RATE)
+    spec = np.fft.rfft(x)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(freqs > 0.0, (cutoff_hz / np.maximum(freqs, 1e-9)) ** (2 * order), np.inf)
+    hp = np.where(freqs > 0.0, 1.0 / (1.0 + ratio), 0.0)
+    return np.fft.irfft(spec * (hp**2), n=len(x))
+
+
+def _bandpass(x: np.ndarray, low_hz: float, high_hz: float) -> np.ndarray:
+    if SCIPY_AVAILABLE and signal is not None:
+        sos = signal.butter(4, [low_hz, high_hz], btype="bandpass", fs=SAMPLE_RATE, output="sos")
+        return signal.sosfiltfilt(sos, x)
+    return _fft_bandpass(x, low_hz, high_hz, order=4)
+
+
+def _highpass(x: np.ndarray, cutoff_hz: float) -> np.ndarray:
+    if SCIPY_AVAILABLE and signal is not None:
+        sos = signal.butter(4, cutoff_hz, btype="highpass", fs=SAMPLE_RATE, output="sos")
+        return signal.sosfiltfilt(sos, x)
+    return _fft_highpass(x, cutoff_hz, order=4)
 
 
 def _generate_genuine_clip(rng: np.random.Generator) -> np.ndarray:
@@ -20,7 +60,6 @@ def _generate_genuine_clip(rng: np.random.Generator) -> np.ndarray:
     f0 = f0_base * (1.0 + contour_depth * np.sin(2.0 * np.pi * contour_rate * t + rng.uniform(0, 6.28)))
     phase = 2.0 * np.pi * np.cumsum(f0) / SAMPLE_RATE
 
-    # Natural glottal spectrum decays smoothly (~1/k^1.35)
     voiced = np.zeros_like(t)
     num_harmonics = int(rng.integers(10, 18))
     for k in range(1, num_harmonics + 1):
@@ -28,18 +67,14 @@ def _generate_genuine_clip(rng: np.random.Generator) -> np.ndarray:
         jitter = rng.normal(0.0, 0.002, size=CLIP_SAMPLES)
         voiced += amp * np.sin(k * phase + jitter)
 
-    # Natural vocal-tract formants (F1, F2, gentle F3) with natural rolloff above 3.8 kHz
     f1_lo = rng.uniform(250.0, 450.0)
     f1_hi = f1_lo + rng.uniform(350.0, 550.0)
     f2_lo = rng.uniform(1000.0, 1500.0)
     f2_hi = f2_lo + rng.uniform(600.0, 1100.0)
 
-    sos1 = signal.butter(4, [f1_lo, f1_hi], btype="bandpass", fs=SAMPLE_RATE, output="sos")
-    sos2 = signal.butter(4, [f2_lo, f2_hi], btype="bandpass", fs=SAMPLE_RATE, output="sos")
     aspiration = rng.standard_normal(CLIP_SAMPLES) * rng.uniform(0.05, 0.14)
-    speech = 0.72 * signal.sosfiltfilt(sos1, voiced) + 0.32 * signal.sosfiltfilt(sos2, voiced + aspiration)
+    speech = 0.72 * _bandpass(voiced, f1_lo, f1_hi) + 0.32 * _bandpass(voiced + aspiration, f2_lo, f2_hi)
 
-    # Multi-rate smooth syllabic modulation + natural pauses
     syl_rate = rng.uniform(2.5, 5.5)
     env = 0.55 + 0.45 * np.sin(2.0 * np.pi * syl_rate * t + rng.uniform(0, 6.28))
     env *= 0.75 + 0.25 * np.cos(2.0 * np.pi * 1.1 * t + rng.uniform(0, 6.28))
@@ -52,7 +87,7 @@ def _generate_spoof_clip(rng: np.random.Generator) -> np.ndarray:
     """Simulate neural vocoder spoof: phase discontinuities, >4kHz metallic buzz, spectral smoothing."""
     t = np.arange(CLIP_SAMPLES, dtype=np.float64) / SAMPLE_RATE
     f0_base = rng.uniform(100.0, 250.0)
-    hop = int(rng.choice([160, 200, 256, 320]))  # 10-20 ms vocoder frame hops
+    hop = int(rng.choice([160, 200, 256, 320]))
     phase = np.zeros_like(t)
     cur_phase = 0.0
     dt_phase = 2.0 * np.pi * f0_base / SAMPLE_RATE
@@ -62,30 +97,23 @@ def _generate_spoof_clip(rng: np.random.Generator) -> np.ndarray:
         cur_phase += dt_phase
         phase[i] = cur_phase
 
-    # Spectrally smoothed / flat harmonic envelope + in-band buzz
     voiced = np.zeros_like(t)
     for k in range(1, 24):
         amp = 1.0 / (k**0.75)
         voiced += amp * np.sin(k * phase)
 
-    # Metallic upper-band (> 4.0 kHz) harmonic buzz / aliasing artifacts
     hf_f0 = rng.uniform(4200.0, 5600.0)
     hf_buzz = (
         0.55 * np.sin(2.0 * np.pi * hf_f0 * t)
         + 0.40 * np.sin(2.0 * np.pi * min(7600.0, hf_f0 + 1300.0) * t + 0.7)
         + 0.30 * np.sin(2.0 * np.pi * rng.uniform(5800.0, 7500.0) * t)
     )
-    sos_hf = signal.butter(4, 4000.0, btype="highpass", fs=SAMPLE_RATE, output="sos")
-    hf_component = signal.sosfiltfilt(sos_hf, hf_buzz + 0.25 * rng.standard_normal(CLIP_SAMPLES))
+    hf_component = _highpass(hf_buzz + 0.25 * rng.standard_normal(CLIP_SAMPLES), 4000.0)
+    mid_component = _bandpass(voiced, 400.0, 3200.0)
 
-    # Narrowband vocoder formant buzz inside 300-3400 Hz (survives telephony bandpass)
-    sos_mid = signal.butter(4, [400.0, 3200.0], btype="bandpass", fs=SAMPLE_RATE, output="sos")
-    mid_component = signal.sosfiltfilt(sos_mid, voiced)
-
-    # Periodic frame-edge micro-glitches (audible vocoder concatenation pulse)
     frame_pulse = np.zeros_like(t)
     frame_pulse[::hop] = rng.uniform(0.15, 0.35) * rng.choice([-1.0, 1.0], size=len(frame_pulse[::hop]))
-    frame_pulse = signal.sosfiltfilt(sos_mid, frame_pulse)
+    frame_pulse = _bandpass(frame_pulse, 400.0, 3200.0)
 
     syl_rate = rng.uniform(2.5, 5.5)
     env = 0.6 + 0.4 * np.sin(2.0 * np.pi * syl_rate * t + rng.uniform(0, 6.28))

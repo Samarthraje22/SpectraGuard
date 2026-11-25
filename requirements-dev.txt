@@ -1,0 +1,10 @@
+-r requirements.txt
+websockets
+scipy
+torch
+torchaudio
+onnx
+onnxruntime
+sqlalchemy
+pytest
+httpx

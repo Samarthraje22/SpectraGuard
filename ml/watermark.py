@@ -3,8 +3,44 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy import signal
-from scipy.linalg import hadamard
+
+try:
+    from scipy import signal
+    from scipy.linalg import hadamard
+
+    SCIPY_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised on slim runtimes without scipy
+    signal = None  # type: ignore[assignment]
+    hadamard = None  # type: ignore[assignment]
+    SCIPY_AVAILABLE = False
+
+
+def _hadamard_numpy(n: int) -> np.ndarray:
+    """Construct Sylvester Hadamard matrix of power-of-two order n in pure NumPy."""
+    h = np.array([[1.0]], dtype=np.float64)
+    while h.shape[0] < n:
+        h = np.block([[h, h], [h, -h]])
+    return h
+
+
+def _butter_bandpass_fft(
+    x: np.ndarray,
+    low_hz: float,
+    high_hz: float,
+    sample_rate: int,
+    order: int = 6,
+) -> np.ndarray:
+    """Zero-phase Butterworth bandpass magnitude-squared filter in pure NumPy FFT domain."""
+    n = len(x)
+    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+    spec = np.fft.rfft(x)
+    lp = 1.0 / (1.0 + (freqs / high_hz) ** (2 * order))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(freqs > 0.0, (low_hz / np.maximum(freqs, 1e-9)) ** (2 * order), np.inf)
+    hp = np.where(freqs > 0.0, 1.0 / (1.0 + ratio), 0.0)
+    # Apply squared response to match zero-phase forward-backward (sosfiltfilt) attenuation
+    gain = (lp * hp) ** 2
+    return np.fft.irfft(spec * gain, n=n)
 
 
 class SpreadSpectrumWatermarker:
@@ -44,13 +80,19 @@ class SpreadSpectrumWatermarker:
         self.pn_sequences = rng.choice([-1.0, 1.0], size=self.frame_length).astype(np.float64)
 
         pow2 = 1 << (self.num_bits - 1).bit_length()
-        h_mat = hadamard(pow2)[: self.num_bits, : self.num_bits].astype(np.float64)
+        if SCIPY_AVAILABLE and hadamard is not None:
+            h_mat = hadamard(pow2)[: self.num_bits, : self.num_bits].astype(np.float64)
+        else:
+            h_mat = _hadamard_numpy(pow2)[: self.num_bits, : self.num_bits]
         raw_codes = np.repeat(h_mat, self.chip_length, axis=1) * self.pn_sequences[None, :]
 
         # Zero-phase Butterworth bandpass filter for 1.5 kHz - 4.0 kHz shaping
-        self._sos = signal.butter(
-            6, [self.low_hz, self.high_hz], btype="bandpass", fs=self.sample_rate, output="sos"
-        )
+        if SCIPY_AVAILABLE and signal is not None:
+            self._sos = signal.butter(
+                6, [self.low_hz, self.high_hz], btype="bandpass", fs=self.sample_rate, output="sos"
+            )
+        else:
+            self._sos = None
 
         # Restrict spread codes strictly to [low_hz, high_hz] and orthonormalize via QR
         freqs = np.fft.rfftfreq(self.frame_length, d=1.0 / self.sample_rate)
@@ -60,6 +102,11 @@ class SpreadSpectrumWatermarker:
         bp_codes = np.fft.irfft(codes_fft, n=self.frame_length, axis=1)
         q_mat, _ = np.linalg.qr(bp_codes.T)
         self._templates = q_mat.T  # shape: (num_bits, frame_length), orthonormal rows
+
+    def _bandpass(self, x: np.ndarray) -> np.ndarray:
+        if self._sos is not None and signal is not None:
+            return signal.sosfiltfilt(self._sos, x)
+        return _butter_bandpass_fft(x, self.low_hz, self.high_hz, self.sample_rate, order=6)
 
     def _speech_mask_envelope(self, x: np.ndarray) -> np.ndarray:
         """Compute a smooth speech-masking amplitude envelope over ~32 ms windows."""
@@ -88,14 +135,14 @@ class SpreadSpectrumWatermarker:
             raise ValueError("All payload_bits must be 0 or 1")
 
         bipolar = np.array([1.0 if b == 1 else -1.0 for b in payload_bits], dtype=np.float64)
-        base_frame = bipolar @ self._templates  # shape: (frame_length,)
+        base_frame = bipolar @ self._templates
 
         n = len(x)
         repeats = (n + self.frame_length - 1) // self.frame_length
         raw_wm = np.tile(base_frame, repeats)[:n]
 
         env = self._speech_mask_envelope(x)
-        shaped_wm = signal.sosfiltfilt(self._sos, raw_wm * env)
+        shaped_wm = self._bandpass(raw_wm * env)
 
         sig_power = float(np.mean(x**2))
         wm_power = float(np.mean(shaped_wm**2))
@@ -121,16 +168,13 @@ class SpreadSpectrumWatermarker:
                 f"Audio length ({len(x)}) must be at least {self.frame_length} samples"
             )
 
-        # Bandpass-filter incoming audio to 1.5 - 4.0 kHz
-        x_bp = signal.sosfiltfilt(self._sos, x)
+        x_bp = self._bandpass(x)
 
-        # Wiener-regularized local RMS normalization balances voiced vs quieter segments
         win_len = max(1, int(0.032 * self.sample_rate))
         kernel = np.ones(win_len, dtype=np.float64) / float(win_len)
         local_pow = np.convolve(x_bp**2, kernel, mode="same") + 0.25 * float(np.mean(x_bp**2)) + 1e-12
         x_norm = x_bp / np.sqrt(local_pow)
 
-        # Coherently fold complete frames and apply folded in-band spectral whitening
         n_full = len(x_norm) // self.frame_length
         folded = x_norm[: n_full * self.frame_length].reshape(n_full, self.frame_length).mean(axis=0)
 

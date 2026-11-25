@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import math
+import wave
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,13 +15,21 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, WebSo
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from scipy import signal
-from scipy.io import wavfile
 
 from app.audit_db import ProvenanceLedger
 from app.inference import SpectraGuardEngine
 from ml.corruptions import add_gaussian_noise, telephony_bandpass
 from ml.signals import _generate_genuine_clip, _generate_spoof_clip
+
+try:
+    from scipy import signal as scipy_signal
+    from scipy.io import wavfile
+
+    SCIPY_WAV_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised on slim serverless runtimes (e.g. Vercel)
+    scipy_signal = None  # type: ignore[assignment]
+    wavfile = None  # type: ignore[assignment]
+    SCIPY_WAV_AVAILABLE = False
 
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -42,33 +51,77 @@ class VerifyAudioRequest(BaseModel):
 
 def _decode_wav_to_16k_mono(raw_bytes: bytes) -> np.ndarray:
     """Decode WAV bytes into 16 kHz mono float32 waveform in [-1.0, 1.0]."""
+    if SCIPY_WAV_AVAILABLE and wavfile is not None:
+        try:
+            sr, data = wavfile.read(io.BytesIO(raw_bytes))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid WAV file: {exc}") from exc
+
+        if data.size == 0:
+            raise HTTPException(status_code=400, detail="WAV file contains no audio samples")
+
+        if np.issubdtype(data.dtype, np.integer):
+            info = np.iinfo(data.dtype)
+            if data.dtype == np.uint8:
+                audio = (data.astype(np.float32) - 128.0) / 128.0
+            else:
+                scale = float(max(abs(info.min), abs(info.max)))
+                audio = data.astype(np.float32) / scale
+        else:
+            audio = data.astype(np.float32)
+
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+        elif audio.ndim != 1:
+            raise HTTPException(status_code=400, detail=f"Unsupported WAV shape: {audio.shape}")
+
+        if sr != TARGET_SAMPLE_RATE and scipy_signal is not None:
+            g = math.gcd(int(sr), TARGET_SAMPLE_RATE)
+            audio = scipy_signal.resample_poly(
+                audio, TARGET_SAMPLE_RATE // g, int(sr) // g
+            ).astype(np.float32)
+        return np.clip(audio, -1.0, 1.0).astype(np.float32)
+
+    # Pure-stdlib wave fallback when scipy is unavailable
     try:
-        sr, data = wavfile.read(io.BytesIO(raw_bytes))
+        with wave.open(io.BytesIO(raw_bytes), "rb") as wf:
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            sr = wf.getframerate()
+            n_frames = wf.getnframes()
+            frames = wf.readframes(n_frames)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid WAV file: {exc}") from exc
 
-    if data.size == 0:
+    if n_frames == 0:
         raise HTTPException(status_code=400, detail="WAV file contains no audio samples")
 
-    if np.issubdtype(data.dtype, np.integer):
-        info = np.iinfo(data.dtype)
-        # Handle unsigned 8-bit PCM ([0, 255]) vs signed integer PCM
-        if data.dtype == np.uint8:
-            audio = (data.astype(np.float32) - 128.0) / 128.0
-        else:
-            scale = float(max(abs(info.min), abs(info.max)))
-            audio = data.astype(np.float32) / scale
+    if sampwidth == 1:
+        audio = (np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif sampwidth == 2:
+        audio = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    elif sampwidth == 3:
+        raw_u8 = np.frombuffer(frames, dtype=np.uint8).reshape(-1, 3)
+        signed = (
+            raw_u8[:, 0].astype(np.int32)
+            | (raw_u8[:, 1].astype(np.int32) << 8)
+            | (raw_u8[:, 2].astype(np.int32) << 16)
+        )
+        signed = np.where(signed & 0x800000, signed - 0x1000000, signed)
+        audio = signed.astype(np.float32) / 8388608.0
+    elif sampwidth == 4:
+        audio = np.frombuffer(frames, dtype="<i4").astype(np.float32) / 2147483648.0
     else:
-        audio = data.astype(np.float32)
+        raise HTTPException(status_code=400, detail=f"Unsupported WAV sample width: {sampwidth}")
 
-    if audio.ndim == 2:
-        audio = audio.mean(axis=1)
-    elif audio.ndim != 1:
-        raise HTTPException(status_code=400, detail=f"Unsupported WAV shape: {audio.shape}")
+    if n_channels > 1:
+        audio = audio.reshape(-1, n_channels).mean(axis=1)
 
-    if sr != TARGET_SAMPLE_RATE:
-        g = math.gcd(int(sr), TARGET_SAMPLE_RATE)
-        audio = signal.resample_poly(audio, TARGET_SAMPLE_RATE // g, int(sr) // g).astype(np.float32)
+    if sr != TARGET_SAMPLE_RATE and len(audio) > 1:
+        target_len = max(1, int(round(len(audio) * TARGET_SAMPLE_RATE / sr)))
+        audio = np.interp(
+            np.linspace(0, len(audio) - 1, target_len), np.arange(len(audio)), audio
+        ).astype(np.float32)
 
     return np.clip(audio, -1.0, 1.0).astype(np.float32)
 
