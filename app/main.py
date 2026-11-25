@@ -20,7 +20,7 @@ from scipy.io import wavfile
 from app.audit_db import ProvenanceLedger
 from app.inference import SpectraGuardEngine
 from ml.corruptions import add_gaussian_noise, telephony_bandpass
-from ml.train_export import _generate_genuine_clip, _generate_spoof_clip
+from ml.signals import _generate_genuine_clip, _generate_spoof_clip
 
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"

@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+websockets
+numpy
+scipy
+onnxruntime
+sqlalchemy
+python-multipart

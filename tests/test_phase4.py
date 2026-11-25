@@ -1,12 +1,17 @@
-"""Phase 4 tests for dashboard serving, demo signals, container config, CI, and docs."""
+"""Phase 4 tests for dashboard serving, demo signals, container/Vercel config, CI, and docs."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import numpy as np
 from fastapi.testclient import TestClient
 
+from app.audit_db import ProvenanceLedger
+from app.inference import _compute_numpy_saliency, compute_log_mel_numpy
 from app.main import create_app
+from ml.signals import _generate_spoof_clip
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -58,3 +63,42 @@ def test_deployment_and_ci_files_exist_and_are_valid() -> None:
     assert "SpectraGuard" in readme
     assert "ROC-AUC" in readme
     assert "INT8" in readme
+
+    req_vercel = (ROOT_DIR / "requirements-vercel.txt").read_text(encoding="utf-8")
+    assert "onnxruntime" in req_vercel
+    assert "torch" not in req_vercel
+
+    vercel_cfg = json.loads((ROOT_DIR / "vercel.json").read_text(encoding="utf-8"))
+    assert vercel_cfg["installCommand"] == "pip install -r requirements-vercel.txt"
+    assert vercel_cfg["functions"]["app/main.py"]["maxDuration"] == 60
+
+
+def test_vercel_fallbacks_work_without_torch(monkeypatch) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("VERCEL", "1")
+    # Avoid creating /tmp db on Windows by checking url selection cleanly if not writable,
+    # or verifying on posix-style /tmp path via monkeypatched create_engine
+    captured_urls: list[str] = []
+
+    import app.audit_db as audit_db_mod
+
+    orig_create_engine = audit_db_mod.create_engine
+
+    def _fake_create_engine(url, **kwargs):
+        captured_urls.append(url)
+        return orig_create_engine("sqlite:///:memory:", **kwargs)
+
+    monkeypatch.setattr(audit_db_mod, "create_engine", _fake_create_engine)
+    _ = ProvenanceLedger()
+    assert captured_urls == ["sqlite:////tmp/spectraguard_audit.db"]
+
+    # Verify torch-free Log-Mel + spectral saliency fallback
+    rng = np.random.default_rng(77)
+    spoof = _generate_spoof_clip(rng)
+    lm_np = compute_log_mel_numpy(spoof)
+    assert lm_np.shape == (1, 1, 64, 126)
+    heatmap, summary = _compute_numpy_saliency(lm_np, 0.99)
+    assert heatmap.shape == (64, 126)
+    assert float(heatmap.min()) >= 0.0
+    assert float(heatmap.max()) <= 1.0
+    assert summary["saliency_mode"] == "spectral_energy_fallback"

@@ -62,9 +62,12 @@ class ProvenanceLedger:
     """Thread-safe, tamper-evident SHA-256 hash-chained audit ledger."""
 
     def __init__(self, database_url: str | None = None) -> None:
-        self.database_url = database_url or os.getenv(
-            "DATABASE_URL", "sqlite:///./spectraguard_audit.db"
+        default_db = (
+            "sqlite:////tmp/spectraguard_audit.db"
+            if os.getenv("VERCEL")
+            else "sqlite:///./spectraguard_audit.db"
         )
+        self.database_url = database_url or os.getenv("DATABASE_URL") or default_db
         connect_args = {"check_same_thread": False} if self.database_url.startswith("sqlite") else {}
         self.engine = create_engine(self.database_url, connect_args=connect_args, future=True)
         Base.metadata.create_all(self.engine)
